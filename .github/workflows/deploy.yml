@@ -1,0 +1,258 @@
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      build:
+        description: Build command, run at the repository root.
+        type: string
+        default: ""
+      build-output:
+        description: Paths the build writes that Terraform reads, one per line.
+        type: string
+        default: ""
+      node-version:
+        description: Node.js version to install.
+        type: string
+        default: ""
+      working-directory:
+        description: Terraform directory.
+        type: string
+        default: infra
+      environment:
+        description: GitHub environment.
+        type: string
+        default: production
+      terraform-version:
+        description: Terraform version.
+        type: string
+        default: latest
+
+env:
+  AWS_ACCOUNT_ID: "578314019836"
+  AWS_REGION: ap-southeast-2
+  STATE_BUCKET: 578314019836-tfstate
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check inputs
+        shell: bash
+        env:
+          BUILD: ${{ inputs.build }}
+          BUILD_OUTPUT: ${{ inputs.build-output }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::The build job must not be able to request an OIDC token."
+            exit 1
+          fi
+          if [ -n "$BUILD" ] && [ -z "${BUILD_OUTPUT//[[:space:]]/}" ]; then
+            echo "::error::Set build-output to the paths the build writes that Terraform reads."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - if: inputs.node-version != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Build
+        if: inputs.build != ''
+        run: ${{ inputs.build }}
+
+      - name: Pack the build output
+        if: inputs.build-output != ''
+        shell: bash
+        env:
+          BUILD_OUTPUT: ${{ inputs.build-output }}
+        run: |
+          set -euo pipefail
+          paths=()
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            if [ -n "$line" ]; then paths+=("$line"); fi
+          done <<< "$BUILD_OUTPUT"
+          tar --dereference --hard-dereference -cf "${RUNNER_TEMP}/build-output.tar" -- "${paths[@]}"
+
+      - if: inputs.build-output != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-output
+          path: ${{ runner.temp }}/build-output.tar
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      REPO: ${{ github.event.repository.name }}
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - if: inputs.build-output != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-output
+          path: ${{ runner.temp }}/build-output
+
+      - name: Restore the build output
+        if: inputs.build-output != ''
+        shell: bash
+        env:
+          ARCHIVE: ${{ runner.temp }}/build-output/build-output.tar
+          BUILD_OUTPUT: ${{ inputs.build-output }}
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        run: |
+          python3 -I - <<'PY'
+          import os
+          import posixpath
+          import shutil
+          import sys
+          import tarfile
+
+          TERRAFORM_SUFFIXES = (".tf", ".tf.json", ".tfvars", ".tfvars.json")
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          def clean(path):
+              """Returns the normalized relative path, or None if it leaves the repository."""
+              path = path.strip()
+              if not path or path.startswith("/") or "\\" in path or ".." in path.split("/"):
+                  return None
+              return posixpath.normpath(path)
+
+
+          def within(path, root):
+              return path == root or path.startswith(root + "/")
+
+
+          def forbidden(path):
+              parts = path.split("/")
+              return (
+                  any(part in (".git", ".github") or part.startswith(".terraform") for part in parts)
+                  or parts[-1].endswith(TERRAFORM_SUFFIXES)
+              )
+
+
+          working_directory = clean(os.environ["WORKING_DIRECTORY"])
+          if working_directory is None:
+              fail("working-directory must be a path inside the repository.")
+
+          outputs = []
+          for line in os.environ["BUILD_OUTPUT"].splitlines():
+              if not line.strip():
+                  continue
+              path = clean(line)
+              if path is None or path == ".":
+                  fail(f"build-output {line.strip()!r} must be a path inside the repository.")
+              if within(working_directory, path):
+                  fail(f"build-output {path!r} contains the Terraform directory {working_directory!r}.")
+              if forbidden(path):
+                  fail(f"build-output {path!r} is a Git, GitHub or Terraform path.")
+              outputs.append(path)
+
+          with tarfile.open(os.environ["ARCHIVE"]) as archive:
+              members = archive.getmembers()
+              for member in members:
+                  path = clean(member.name)
+                  if not (member.isfile() or member.isdir()):
+                      fail(f"{member.name!r} in the build output is not a regular file or directory.")
+                  if path is None or forbidden(path) or not any(within(path, o) for o in outputs):
+                      fail(f"{member.name!r} in the build output is outside build-output or is a Terraform file.")
+
+              for path in outputs:
+                  if os.path.islink(path) or os.path.isfile(path):
+                      os.remove(path)
+                  elif os.path.isdir(path):
+                      shutil.rmtree(path)
+
+              archive.extractall(path=".", members=members, filter="data")
+
+          files = sum(1 for member in members if member.isfile())
+          print(f"Restored {files} files into {', '.join(outputs)}")
+          PY
+
+      - name: Log into AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/deploy-${{ github.event.repository.name }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Load deploy credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          params="$(aws ssm get-parameters-by-path \
+            --path "/deploy/${REPO}" \
+            --with-decryption \
+            --query 'Parameters[].{name: Name, type: Type, value: Value}' \
+            --output json)"
+
+          count="$(jq length <<< "$params")"
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::No parameters under /deploy/${REPO}"
+            exit 0
+          fi
+
+          for ((i = 0; i < count; i++)); do
+            name="$(jq -r ".[$i].name" <<< "$params")"
+            type="$(jq -r ".[$i].type" <<< "$params")"
+            value="$(jq -r ".[$i].value" <<< "$params")"
+            if [ "$type" = "SecureString" ]; then
+              while IFS= read -r line; do
+                if [ -n "$line" ]; then echo "::add-mask::${line}"; fi
+              done <<< "$value"
+            fi
+            delimiter="EOF_$(openssl rand -hex 16)"
+            {
+              echo "${name##*/}<<${delimiter}"
+              printf '%s\n' "$value"
+              echo "$delimiter"
+            } >> "$GITHUB_ENV"
+          done
+          echo "Loaded ${count} parameters from /deploy/${REPO}"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=projects/${REPO}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      - name: terraform apply
+        working-directory: ${{ inputs.working-directory }}
+        run: terraform apply -auto-approve
